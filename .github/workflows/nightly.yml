@@ -1,0 +1,184 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  schedule:
+    # Run nightly at 2:00 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    # Allow manual trigger
+
+env:
+  GO_VERSION: '1.21'
+  BINARY_NAME: 'files'
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    
+    - name: Run tests
+      run: go test -v ./...
+    
+    - name: Build
+      run: go build -v ./...
+    
+    - name: Test basic functionality
+      run: |
+        go build -o ${{ env.BINARY_NAME }} .
+        ./${{ env.BINARY_NAME }} -h 2>&1 | grep -q "host"
+
+  build:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+        exclude:
+          - goos: windows
+            goarch: arm64
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    
+    - name: Build binary
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+      run: |
+        mkdir -p dist
+        BINARY_NAME="${{ env.BINARY_NAME }}"
+        if [ "$GOOS" = "windows" ]; then
+          BINARY_NAME="${BINARY_NAME}.exe"
+        fi
+        go build -ldflags="-s -w" -o "dist/${BINARY_NAME}-${GOOS}-${GOARCH}${BINARY_NAME##*/}" .
+        
+        # Create archive
+        cd dist
+        if [ "$GOOS" = "windows" ]; then
+          zip "${BINARY_NAME%-*}-${GOOS}-${GOARCH}.zip" "${BINARY_NAME}-${GOOS}-${GOARCH}${BINARY_NAME##*/}"
+        else
+          tar -czf "${BINARY_NAME%-*}-${GOOS}-${GOARCH}.tar.gz" "${BINARY_NAME}-${GOOS}-${GOARCH}${BINARY_NAME##*/}"
+        fi
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+        path: dist/*
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    
+    - name: Prepare release assets
+      run: |
+        mkdir -p release-assets
+        find artifacts -name "*.tar.gz" -o -name "*.zip" | xargs -I {} cp {} release-assets/
+        ls -la release-assets/
+    
+    - name: Generate release tag
+      id: tag
+      run: |
+        if [ "${{ github.event_name }}" = "schedule" ]; then
+          TAG="nightly"
+          echo "RELEASE_TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "RELEASE_NAME=Nightly Release $(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          echo "IS_PRERELEASE=true" >> $GITHUB_OUTPUT
+        else
+          TAG="manual"
+          echo "RELEASE_TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "RELEASE_NAME=Manual Release $(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+          echo "IS_PRERELEASE=false" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Delete existing nightly release
+      if: github.event_name == 'schedule'
+      run: |
+        gh release delete nightly --yes || true
+        git push origin :refs/tags/nightly-$(date +'%Y%m%d') || true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.tag.outputs.RELEASE_TAG }}
+        name: ${{ steps.tag.outputs.RELEASE_NAME }}
+        draft: false
+        prerelease: ${{ steps.tag.outputs.IS_PRERELEASE }}
+        files: release-assets/*
+        body: |
+          ## files - File Server
+          
+          This release contains pre-compiled binaries for multiple platforms.
+          
+          ### Features
+          - File browsing via web interface
+          - File upload with drag & drop support
+          - File download with resume support
+          - Cross-platform compatibility
+          
+          ### Usage
+          ```bash
+          # Run server on localhost:8080
+          ./files
+          
+          # Specify custom port
+          ./files -port 9000
+          
+          # Specify custom listening address and port
+          ./files -host 192.168.1.100 -port 9000
+          
+          # Serve files from specific directory
+          ./files -dir /path/to/files
+          ```
+          
+          ### Available Binaries
+          - `files-linux-amd64.tar.gz` - Linux x86_64
+          - `files-linux-arm64.tar.gz` - Linux ARM64
+          - `files-darwin-amd64.tar.gz` - macOS Intel
+          - `files-darwin-arm64.tar.gz` - macOS Apple Silicon
+          - `files-windows-amd64.zip` - Windows x86_64
+          
+          ### Installation
+          1. Download the appropriate binary for your platform
+          2. Extract the archive
+          3. Make the binary executable (Linux/macOS): `chmod +x files`
+          4. Optionally, move to a directory in your PATH
+          
+          ### Options
+          - `-host` - Address to listen on (default: 0.0.0.0)
+          - `-port` - Port to listen on (default: 8080)
+          - `-dir` - Working directory to serve files from (default: current directory)
+          
+          ---
+          *This is an automated ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }} release*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
