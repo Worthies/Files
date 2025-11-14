@@ -13,9 +13,51 @@ A simple and powerful file server written in Go with support for browsing, uploa
 
 ## Installation
 
+### Install (recommended)
+
+Install the latest stable release with the `go` command:
+
 ```bash
-go build -o files main.go
+go install github.com/worthies/files@latest
 ```
+
+Install the current tip of the default branch (useful for nightly/testing builds):
+
+```bash
+go install github.com/worthies/files@master
+```
+
+### Download pre-compiled binaries
+
+You can also download pre-compiled binaries from the [nightly releases](https://github.com/worthies/files/releases):
+
+1. Go to the [Releases page](https://github.com/worthies/files/releases)
+2. Download the appropriate binary for your platform (Windows, Linux, macOS)
+3. Make the binary executable (on Unix-like systems): `chmod +x files`
+4. Move it to a directory in your PATH or run it directly
+
+Notes:
+- `go install ...@latest` installs the latest released module version.
+- Installing `@master` (or `@main`) fetches the tip of the branch — treat this as a nightly/edge build.
+- The installed binary is placed in `$GOBIN` (if set) or `$(go env GOPATH)/bin`; make sure that directory is on your `PATH`:
+
+```bash
+export PATH=$PATH:$(go env GOPATH)/bin
+```
+
+### Build from source
+
+If you prefer to build locally:
+
+```bash
+git clone https://github.com/worthies/files.git
+cd files
+go build -o files ./...
+```
+
+Requirements:
+- Go 1.21 or newer (see `go.mod`).
+
 
 ## Usage
 
