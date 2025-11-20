@@ -79,6 +79,7 @@ Options:
 - `-host <address>` - Address to listen on (default: 0.0.0.0)
 - `-port <port>` - Port to listen on (default: 8080)
 - `-dir <directory>` - Working directory to serve files from (default: current directory)
+- `-i <config>` - Enable intelligent MIME recognition for browser-viewable multimedia. Use `true` for default mappings, or specify custom mappings in format: `ext1,ext2:mime/type;ext3:mime/type2,v` where `,v` indicates viewable in browser (optional)
 
 ### Examples
 
@@ -102,7 +103,35 @@ Combine options:
 ./files -host 192.168.1.100 -port 9000 -dir /path/to/files
 ```
 
+Enable intelligent MIME recognition:
+```bash
+./files -i true
+```
+
+Enable intelligent MIME recognition with custom MIME type mappings:
+```bash
+# Map .mhtml, .shtml to text/html (viewable in browser)
+./files -i "mhtml,shtml:text/html,v"
+
+# Multiple mappings with different MIME types
+./files -i "mhtml,shtml:text/html,v;custom:application/custom;doc:application/msword"
+
+# Mix viewable and non-viewable types
+./files -i "mhtml,shtml:text/html,v;archive:application/x-archive"
+```
+
+Enable intelligent MIME recognition with other options:
+```bash
+./files -i true -port 9000 -dir /path/to/files
+./files -i "mhtml,shtml:text/html,v" -port 9000 -dir /path/to/files
+```
+
 ## Features Details
+
+### Request Logging
+- All HTTP requests are logged to console with method, path, and client IP address
+- Request completion time is displayed for performance monitoring
+- Useful for debugging and monitoring server activity
 
 ### File Browsing
 - Navigate through directories using the web interface
@@ -121,6 +150,15 @@ You can also drag and drop files directly onto the browse page!
 - Click on any file to download it
 - Resume support: Partial downloads can be resumed if interrupted
 - Automatic file name preservation
+
+### Intelligent MIME Recognition
+When enabled with `-i`, the server intelligently recognizes file types and serves them inline in the browser when appropriate:
+- **Default mode** (`-i true`): Recognizes common multimedia and document types (images, audio, video, PDF, HTML, etc.)
+- **Custom mappings**: Map file extensions to custom MIME types with optional viewability control
+  - Example: `jpg,png:image/jpeg,v` maps .jpg and .png files to image/jpeg and marks as viewable
+  - Non-viewable types: `zip:application/zip` will download the file
+  - Viewable types marked with `,v`: served inline in browser
+  - Without `,v`: serves as attachment (download)
 
 ### Security
 - Path traversal protection prevents accessing files outside the configured directory

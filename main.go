@@ -21,8 +21,11 @@ var templateFS embed.FS
 var templates *template.Template
 
 var (
-	addr       string
-	workingDir string
+	addr               string
+	workingDir         string
+	intelligentMIME    bool
+	customMIMETypes    map[string]string
+	customMIMEViewable map[string]bool
 )
 
 type FileInfo struct {
@@ -88,7 +91,21 @@ func main() {
 	hostFlag := flag.String("host", "0.0.0.0", "Address to listen on")
 	portFlag := flag.String("port", "8080", "Port to listen on")
 	dirFlag := flag.String("dir", "", "Working directory to serve files from (default: current directory)")
+	intelligentMIMEFlag := flag.String("i", "", "Enable intelligent MIME recognition. Use 'true' for defaults, or specify custom mappings like 'ext1,ext2:mime/type;ext3:mime/type2,v' (,v indicates viewable)")
 	flag.Parse()
+
+	// Initialize custom MIME types map
+	customMIMETypes = make(map[string]string)
+	customMIMEViewable = make(map[string]bool)
+
+	// Process the -i flag
+	if *intelligentMIMEFlag != "" {
+		intelligentMIME = true
+		if *intelligentMIMEFlag != "true" {
+			// Parse custom MIME type mappings
+			parseCustomMIMETypes(*intelligentMIMEFlag)
+		}
+	}
 
 	// Set address
 	addr = fmt.Sprintf("%s:%s", *hostFlag, strings.TrimPrefix(*portFlag, ":"))
@@ -113,14 +130,27 @@ func main() {
 		}
 	}
 
-	http.HandleFunc("/", browseHandler)
-	http.HandleFunc("/download/", downloadHandler)
-	http.HandleFunc("/upload", uploadHandler)
+	http.HandleFunc("/", logRequestMiddleware(browseHandler))
+	http.HandleFunc("/download/", logRequestMiddleware(downloadHandler))
+	http.HandleFunc("/upload", logRequestMiddleware(uploadHandler))
 
 	log.Printf("Server starting on http://%s", addr)
 	log.Printf("Serving files from: %s", workingDir)
+	if intelligentMIME {
+		log.Printf("Intelligent MIME recognition enabled")
+	}
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatal("Server failed:", err)
+	}
+}
+
+// logRequestMiddleware wraps a handler to log HTTP requests
+func logRequestMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		log.Printf("[%s] %s %s", r.Method, r.URL.Path, r.RemoteAddr)
+		next(w, r)
+		log.Printf("[%s] %s completed in %v", r.Method, r.URL.Path, time.Since(start))
 	}
 }
 
@@ -260,10 +290,21 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	fileSize := fileInfo.Size()
 	fileName := filepath.Base(fullPath)
 
+	// Determine content type and disposition
+	contentType := "application/octet-stream"
+	disposition := "attachment"
+
+	if intelligentMIME {
+		if mimeType, isViewable := getMIMEType(fullPath); isViewable {
+			contentType = mimeType
+			disposition = "inline"
+		}
+	}
+
 	// Set headers for file download
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fileName))
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, disposition, fileName))
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Type", contentType)
 
 	// Handle range requests for resume support
 	rangeHeader := r.Header.Get("Range")
@@ -391,6 +432,207 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 type byteRange struct {
 	start int64
 	end   int64
+}
+
+// parseCustomMIMETypes parses custom MIME type mappings from a string
+// Format: "ext1,ext2:mime/type;ext3:mime/type2,v;ext4:mime/type3"
+// Multiple extensions can be mapped to the same MIME type by comma-separating them
+// Optional ",v" suffix after MIME type indicates the type is viewable in browser (default: false)
+func parseCustomMIMETypes(input string) {
+	// Split by semicolon to get each mapping group
+	mappings := strings.Split(input, ";")
+
+	for _, mapping := range mappings {
+		mapping = strings.TrimSpace(mapping)
+		if mapping == "" {
+			continue
+		}
+
+		// Split by colon to separate extensions from MIME type (and optional viewability flag)
+		parts := strings.Split(mapping, ":")
+		if len(parts) != 2 {
+			log.Printf("Invalid MIME mapping format: %s (expected 'ext:mime/type' or 'ext:mime/type,v')", mapping)
+			continue
+		}
+
+		extensions := strings.TrimSpace(parts[0])
+		mimeInfo := strings.TrimSpace(parts[1])
+
+		if extensions == "" || mimeInfo == "" {
+			log.Printf("Empty extension or MIME type in mapping: %s", mapping)
+			continue
+		}
+
+		// Check if the mime info has the ,v suffix to indicate viewable
+		isViewable := false
+		if strings.HasSuffix(mimeInfo, ",v") {
+			isViewable = true
+			mimeInfo = strings.TrimSuffix(mimeInfo, ",v")
+			mimeInfo = strings.TrimSpace(mimeInfo)
+		}
+
+		if mimeInfo == "" {
+			log.Printf("Empty MIME type after removing suffix: %s", mapping)
+			continue
+		}
+
+		// Split by comma to handle multiple extensions with the same MIME type
+		extList := strings.Split(extensions, ",")
+		for _, ext := range extList {
+			ext = strings.TrimSpace(ext)
+			if ext == "" {
+				continue
+			}
+
+			// Normalize extension to start with dot
+			if !strings.HasPrefix(ext, ".") {
+				ext = "." + ext
+			}
+			ext = strings.ToLower(ext)
+
+			customMIMETypes[ext] = mimeInfo
+			customMIMEViewable[ext] = isViewable
+			viewStr := "not viewable"
+			if isViewable {
+				viewStr = "viewable"
+			}
+			log.Printf("Registered custom MIME type: %s -> %s (%s)", ext, mimeInfo, viewStr)
+		}
+	}
+}
+
+// getMIMEType returns the MIME type for a file based on its extension
+// Returns (mimeType, isViewable) where isViewable indicates if it's a browser-viewable multimedia type
+func getMIMEType(filePath string) (string, bool) {
+	ext := strings.ToLower(filepath.Ext(filePath))
+
+	// Check custom MIME types first
+	if customMime, exists := customMIMETypes[ext]; exists {
+		isViewable := customMIMEViewable[ext]
+		return customMime, isViewable
+	}
+
+	// Image types
+	imageTypes := map[string]bool{
+		".jpg":  true,
+		".jpeg": true,
+		".png":  true,
+		".gif":  true,
+		".bmp":  true,
+		".webp": true,
+		".svg":  true,
+		".ico":  true,
+	}
+
+	// Audio types
+	audioTypes := map[string]bool{
+		".mp3":  true,
+		".wav":  true,
+		".flac": true,
+		".aac":  true,
+		".ogg":  true,
+		".m4a":  true,
+		".weba": true,
+	}
+
+	// Video types
+	videoTypes := map[string]bool{
+		".mp4":  true,
+		".webm": true,
+		".ogv":  true,
+		".mov":  true,
+		".mkv":  true,
+		".avi":  true,
+		".flv":  true,
+		".m3u8": true,
+	}
+
+	// Text/document types that browsers can display
+	documentTypes := map[string]bool{
+		".html": true,
+		".htm":  true,
+		".txt":  true,
+		".pdf":  true,
+		".xml":  true,
+	}
+
+	// Check image types
+	if imageTypes[ext] {
+		switch ext {
+		case ".jpg", ".jpeg":
+			return "image/jpeg", true
+		case ".png":
+			return "image/png", true
+		case ".gif":
+			return "image/gif", true
+		case ".bmp":
+			return "image/bmp", true
+		case ".webp":
+			return "image/webp", true
+		case ".svg":
+			return "image/svg+xml", true
+		case ".ico":
+			return "image/x-icon", true
+		}
+	}
+
+	// Check audio types
+	if audioTypes[ext] {
+		switch ext {
+		case ".mp3":
+			return "audio/mpeg", true
+		case ".wav":
+			return "audio/wav", true
+		case ".flac":
+			return "audio/flac", true
+		case ".aac":
+			return "audio/aac", true
+		case ".ogg":
+			return "audio/ogg", true
+		case ".m4a":
+			return "audio/mp4", true
+		case ".weba":
+			return "audio/webp", true
+		}
+	}
+
+	// Check video types
+	if videoTypes[ext] {
+		switch ext {
+		case ".mp4":
+			return "video/mp4", true
+		case ".webm":
+			return "video/webm", true
+		case ".ogv":
+			return "video/ogg", true
+		case ".mov":
+			return "video/quicktime", true
+		case ".mkv":
+			return "video/x-matroska", true
+		case ".avi":
+			return "video/x-msvideo", true
+		case ".flv":
+			return "video/x-flv", true
+		case ".m3u8":
+			return "application/vnd.apple.mpegurl", true
+		}
+	}
+
+	// Check document types
+	if documentTypes[ext] {
+		switch ext {
+		case ".html", ".htm":
+			return "text/html", true
+		case ".txt":
+			return "text/plain", true
+		case ".pdf":
+			return "application/pdf", true
+		case ".xml":
+			return "application/xml", true
+		}
+	}
+
+	return "application/octet-stream", false
 }
 
 // parseRange parses a Range header value
