@@ -80,6 +80,11 @@ Options:
 - `-port <port>` - Port to listen on (default: 8080)
 - `-dir <directory>` - Working directory to serve files from (default: current directory)
 - `-i <config>` - Enable intelligent MIME recognition for browser-viewable multimedia. Use `true` for default mappings, or specify custom mappings in format: `ext1,ext2:mime/type;ext3:mime/type2,v` where `,v` indicates viewable in browser (optional)
+- `-auth <rule>` - Enable HTTP Basic authentication and authorization rules. Rules can be in these formats:
+  - `password` — A single password string; any username is accepted if this password matches.
+  - `username:password` — Username and password pair with full `rw` access.
+  - `username:password:permission:pattern` — Username, password, permission (one of `r`, `w`, `rw`), and a glob-style pattern describing the path(s) this rule affects (e.g., `public/*`, `*.txt`). Patterns are converted to a regular expression and anchored against the entire path.
+  - The `-auth` flag may be provided multiple times, and each flag value can contain multiple comma-separated rules (e.g., `-auth "u1:p1,u2:p2"`). When any auth rule matches, access is granted according to matched permissions.
 
 ### Examples
 
@@ -164,6 +169,26 @@ When enabled with `-i`, the server intelligently recognizes file types and serve
 - Path traversal protection prevents accessing files outside the configured directory
 - All paths are validated and sanitized
 - No execution of uploaded files
+
+### Authentication
+- The server supports HTTP Basic authentication using the `-auth` command-line flag. When authentication is enabled by providing at least one `-auth` rule, the server requires valid credentials on every request.
+- Rules are evaluated in order; a user is authorized if any rule's username/password matches and the requested path is permitted by that rule.
+- `r` permission is required to browse or download files; `w` permission is required to upload files. If a rule has no pattern, it applies to the entire served tree.
+
+Examples:
+```bash
+# Accept any username with the password "secret123"
+./files -auth "secret123"
+
+# Add two accounts with full access
+./files -auth "admin:adminpass" -auth "user:userpass"
+
+# A read-only user limited to *.txt under the public directory
+./files -auth "reader:readpass:r:public/*.txt"
+
+# Comma-separated rules in a single flag
+./files -auth "user1:pass1,user2:pass2,guest:guestpass:r:public/*"
+```
 
 ## API Endpoints
 

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"crypto/subtle"
 	"embed"
 	"flag"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -26,7 +29,23 @@ var (
 	intelligentMIME    bool
 	customMIMETypes    map[string]string
 	customMIMEViewable map[string]bool
+	authRules          []AuthRule
+	authEnabled        bool
 )
+
+// AuthRule represents an authentication and authorization rule
+type AuthRule struct {
+	Username   string
+	Password   string
+	Permission string // "r" (read), "w" (write), "rw" (read+write), or "" (any username with password)
+	Pattern    *regexp.Regexp
+}
+
+// UserContext stores authenticated user information
+type UserContext struct {
+	Username string
+	Rules    []AuthRule
+}
 
 type FileInfo struct {
 	Name    string
@@ -86,12 +105,29 @@ func joinPath(parts ...string) string {
 	return filepath.Join(parts...)
 }
 
+// authFlags is a custom flag type to collect multiple -auth flags
+type authFlags []string
+
+func (a *authFlags) String() string {
+	return strings.Join(*a, ",")
+}
+
+func (a *authFlags) Set(value string) error {
+	*a = append(*a, value)
+	return nil
+}
+
 func main() {
 	// Parse command-line flags
 	hostFlag := flag.String("host", "0.0.0.0", "Address to listen on")
 	portFlag := flag.String("port", "8080", "Port to listen on")
 	dirFlag := flag.String("dir", "", "Working directory to serve files from (default: current directory)")
 	intelligentMIMEFlag := flag.String("i", "", "Enable intelligent MIME recognition. Use 'true' for defaults, or specify custom mappings like 'ext1,ext2:mime/type;ext3:mime/type2,v' (,v indicates viewable)")
+
+	// Define auth flag to collect multiple -auth flags
+	var authFlagValues authFlags
+	flag.Var(&authFlagValues, "auth", "Authentication rules. Can be: password, username:password, or username:password:permission:pattern. Can be specified multiple times or comma-separated.")
+
 	flag.Parse()
 
 	// Initialize custom MIME types map
@@ -130,9 +166,18 @@ func main() {
 		}
 	}
 
-	http.HandleFunc("/", logRequestMiddleware(browseHandler))
-	http.HandleFunc("/download/", logRequestMiddleware(downloadHandler))
-	http.HandleFunc("/upload", logRequestMiddleware(uploadHandler))
+	// Parse authentication rules
+	if len(authFlagValues) > 0 {
+		authEnabled = true
+		if err := parseAuthRules(authFlagValues); err != nil {
+			log.Fatal("Failed to parse authentication rules:", err)
+		}
+		log.Printf("Authentication enabled with %d rule(s)", len(authRules))
+	}
+
+	http.HandleFunc("/", authMiddleware(logRequestMiddleware(browseHandler)))
+	http.HandleFunc("/download/", authMiddleware(logRequestMiddleware(downloadHandler)))
+	http.HandleFunc("/upload", authMiddleware(logRequestMiddleware(uploadHandler)))
 
 	log.Printf("Server starting on http://%s", addr)
 	log.Printf("Serving files from: %s", workingDir)
@@ -154,6 +199,220 @@ func logRequestMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// parseAuthRules parses authentication rules from command-line flags
+func parseAuthRules(authFlagValues []string) error {
+	for _, flagValue := range authFlagValues {
+		// Split by comma to handle multiple rules in one flag
+		rules := strings.Split(flagValue, ",")
+		for _, rule := range rules {
+			rule = strings.TrimSpace(rule)
+			if rule == "" {
+				continue
+			}
+
+			parts := strings.Split(rule, ":")
+			switch len(parts) {
+			case 1:
+				// Format: password (any username)
+				authRules = append(authRules, AuthRule{
+					Username:   "",
+					Password:   parts[0],
+					Permission: "rw",
+					Pattern:    nil,
+				})
+				log.Printf("Added auth rule: password-only (any username)")
+
+			case 2:
+				// Format: username:password
+				authRules = append(authRules, AuthRule{
+					Username:   parts[0],
+					Password:   parts[1],
+					Permission: "rw",
+					Pattern:    nil,
+				})
+				log.Printf("Added auth rule: %s (full access)", parts[0])
+
+			case 4:
+				// Format: username:password:permission:pattern
+				perm := strings.ToLower(parts[2])
+				if perm != "r" && perm != "w" && perm != "rw" {
+					return fmt.Errorf("invalid permission '%s' in rule '%s' (must be r, w, or rw)", parts[2], rule)
+				}
+
+				// Compile the glob pattern to regex
+				pattern := parts[3]
+				regex, err := globToRegex(pattern)
+				if err != nil {
+					return fmt.Errorf("invalid pattern '%s' in rule '%s': %v", parts[3], rule, err)
+				}
+
+				authRules = append(authRules, AuthRule{
+					Username:   parts[0],
+					Password:   parts[1],
+					Permission: perm,
+					Pattern:    regex,
+				})
+				log.Printf("Added auth rule: %s (permission: %s, pattern: %s)", parts[0], perm, pattern)
+
+			default:
+				return fmt.Errorf("invalid auth rule format: '%s' (expected password, username:password, or username:password:permission:pattern)", rule)
+			}
+		}
+	}
+
+	if len(authRules) == 0 {
+		return fmt.Errorf("no valid auth rules found")
+	}
+
+	return nil
+}
+
+// globToRegex converts a glob pattern to a regular expression
+func globToRegex(pattern string) (*regexp.Regexp, error) {
+	// Escape special regex characters except * and ?
+	regexPattern := regexp.QuoteMeta(pattern)
+	// Replace escaped glob wildcards with regex equivalents
+	regexPattern = strings.ReplaceAll(regexPattern, "\\*", ".*")
+	regexPattern = strings.ReplaceAll(regexPattern, "\\?", ".")
+	// Anchor the pattern to match the entire path
+	regexPattern = "^" + regexPattern + "$"
+	return regexp.Compile(regexPattern)
+}
+
+// authMiddleware handles HTTP Basic Authentication
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// If authentication is not enabled, proceed without checks
+		if !authEnabled {
+			next(w, r)
+			return
+		}
+
+		// Extract credentials from Basic Auth
+		username, password, ok := r.BasicAuth()
+		if !ok {
+			requestAuth(w, "Authorization required")
+			return
+		}
+
+		// Authenticate and get user context
+		userCtx, authenticated := authenticate(username, password)
+		if !authenticated {
+			requestAuth(w, "Invalid credentials")
+			return
+		}
+
+		// Store user context in request context
+		ctx := r.Context()
+		ctx = setUserContext(ctx, userCtx)
+		r = r.WithContext(ctx)
+
+		next(w, r)
+	}
+}
+
+// authenticate validates credentials and returns user context
+func authenticate(username, password string) (*UserContext, bool) {
+	var matchedRules []AuthRule
+
+	for _, rule := range authRules {
+		// Check if username matches (empty username in rule means any username)
+		usernameMatches := rule.Username == "" || rule.Username == username
+
+		// Use constant-time comparison for password
+		passwordMatches := subtle.ConstantTimeCompare([]byte(rule.Password), []byte(password)) == 1
+
+		if usernameMatches && passwordMatches {
+			matchedRules = append(matchedRules, rule)
+		}
+	}
+
+	if len(matchedRules) == 0 {
+		return nil, false
+	}
+
+	return &UserContext{
+		Username: username,
+		Rules:    matchedRules,
+	}, true
+}
+
+// requestAuth sends a 401 Unauthorized response with WWW-Authenticate header
+func requestAuth(w http.ResponseWriter, message string) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="File Server"`)
+	http.Error(w, message, http.StatusUnauthorized)
+}
+
+// Context key type for user context
+type contextKey string
+
+const userContextKey contextKey = "user"
+
+// setUserContext stores user context in the request context
+func setUserContext(ctx context.Context, user *UserContext) context.Context {
+	return context.WithValue(ctx, userContextKey, user)
+}
+
+// getUserContext retrieves user context from the request context
+func getUserContext(r *http.Request) *UserContext {
+	if user, ok := r.Context().Value(userContextKey).(*UserContext); ok {
+		return user
+	}
+	return nil
+}
+
+// hasReadPermission checks if the user has read permission for a path
+func hasReadPermission(user *UserContext, path string) bool {
+	if user == nil {
+		return !authEnabled
+	}
+
+	for _, rule := range user.Rules {
+		// Check if permission includes read
+		if !strings.Contains(rule.Permission, "r") {
+			continue
+		}
+
+		// If no pattern is specified, allow access
+		if rule.Pattern == nil {
+			return true
+		}
+
+		// Check if path matches the pattern
+		if rule.Pattern.MatchString(path) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hasWritePermission checks if the user has write permission for a path
+func hasWritePermission(user *UserContext, path string) bool {
+	if user == nil {
+		return !authEnabled
+	}
+
+	for _, rule := range user.Rules {
+		// Check if permission includes write
+		if !strings.Contains(rule.Permission, "w") {
+			continue
+		}
+
+		// If no pattern is specified, allow access
+		if rule.Pattern == nil {
+			return true
+		}
+
+		// Check if path matches the pattern
+		if rule.Pattern.MatchString(path) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // browseHandler handles file browsing requests
 func browseHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -163,6 +422,14 @@ func browseHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Get the requested path (relative to workingDir)
 	requestedPath := strings.TrimPrefix(r.URL.Path, "/")
+
+	// Check read permission
+	user := getUserContext(r)
+	if !hasReadPermission(user, requestedPath) {
+		http.Error(w, "Access denied: insufficient permissions for this path", http.StatusForbidden)
+		return
+	}
+
 	fullPath := filepath.Join(workingDir, requestedPath)
 
 	// Security check: ensure the path is within workingDir
@@ -248,6 +515,14 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Get the requested file path
 	requestedPath := strings.TrimPrefix(r.URL.Path, "/download/")
+
+	// Check read permission
+	user := getUserContext(r)
+	if !hasReadPermission(user, requestedPath) {
+		http.Error(w, "Access denied: insufficient permissions for this path", http.StatusForbidden)
+		return
+	}
+
 	fullPath := filepath.Join(workingDir, requestedPath)
 
 	// Security check: ensure the path is within workingDir
@@ -364,6 +639,9 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get user context for permission checks
+	user := getUserContext(r)
+
 	// Parse multipart form (max 100MB in memory)
 	if err := r.ParseMultipartForm(100 << 20); err != nil {
 		http.Error(w, "Error parsing form: "+err.Error(), http.StatusBadRequest)
@@ -381,10 +659,12 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	// Get optional subdirectory
 	subDir := r.FormValue("directory")
 	targetDir := workingDir
+	uploadPath := ""
 	if subDir != "" {
 		// Clean and validate subdirectory path
 		subDir = filepath.Clean(subDir)
 		targetDir = filepath.Join(workingDir, subDir)
+		uploadPath = subDir
 
 		// Security check
 		cleanTargetDir, err := filepath.Abs(targetDir)
@@ -405,8 +685,18 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Create destination file
-	dstPath := filepath.Join(targetDir, filepath.Base(header.Filename))
+	// Create destination file path
+	fileName := filepath.Base(header.Filename)
+	dstPath := filepath.Join(targetDir, fileName)
+
+	// Build the relative path for permission checking
+	filePath := filepath.Join(uploadPath, fileName)
+
+	// Check write permission
+	if !hasWritePermission(user, filePath) {
+		http.Error(w, "Access denied: insufficient write permissions for this path", http.StatusForbidden)
+		return
+	}
 	dst, err := os.Create(dstPath)
 	if err != nil {
 		http.Error(w, "Error creating file: "+err.Error(), http.StatusInternalServerError)
