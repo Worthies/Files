@@ -2,19 +2,24 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
+	"mime/multipart"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,11 +32,17 @@ var (
 	addr               string
 	workingDir         string
 	intelligentMIME    bool
+	verbose            bool
 	customMIMETypes    map[string]string
 	customMIMEViewable map[string]bool
 	authRules          []AuthRule
 	authEnabled        bool
+
+	sessions   = make(map[string]*UserContext)
+	sessionsMu sync.RWMutex
 )
+
+const sessionCookieName = "files_session"
 
 // AuthRule represents an authentication and authorization rule
 type AuthRule struct {
@@ -60,6 +71,7 @@ type PageData struct {
 	ParentPath  string
 	Files       []FileInfo
 	Error       string
+	Token       string
 }
 
 func init() {
@@ -117,6 +129,45 @@ func (a *authFlags) Set(value string) error {
 	return nil
 }
 
+func getLocalIPs() []string {
+	var ips []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ips
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			if ip4 := ip.To4(); ip4 != nil {
+				ips = append(ips, ip4.String())
+			}
+		}
+	}
+	return ips
+}
+
+func logVerbose(format string, v ...interface{}) {
+	if verbose {
+		log.Printf("[verbose] "+format, v...)
+	}
+}
+
 func main() {
 	// Parse command-line flags
 	hostFlag := flag.String("host", "0.0.0.0", "Address to listen on")
@@ -124,11 +175,15 @@ func main() {
 	dirFlag := flag.String("dir", "", "Working directory to serve files from (default: current directory)")
 	intelligentMIMEFlag := flag.String("i", "", "Enable intelligent MIME recognition. Use 'true' for defaults, or specify custom mappings like 'ext1,ext2:mime/type;ext3:mime/type2,v' (,v indicates viewable)")
 
+	verboseFlag := flag.Bool("verbose", false, "Enable verbose logging for debugging")
+
 	// Define auth flag to collect multiple -auth flags
 	var authFlagValues authFlags
 	flag.Var(&authFlagValues, "auth", "Authentication rules. Can be: password, username:password, or username:password:permission:pattern. Can be specified multiple times or comma-separated.")
 
 	flag.Parse()
+
+	verbose = *verboseFlag
 
 	// Initialize custom MIME types map
 	customMIMETypes = make(map[string]string)
@@ -179,7 +234,16 @@ func main() {
 	http.HandleFunc("/download/", authMiddleware(logRequestMiddleware(downloadHandler)))
 	http.HandleFunc("/upload", authMiddleware(logRequestMiddleware(uploadHandler)))
 
-	log.Printf("Server starting on http://%s", addr)
+	port := strings.TrimPrefix(*portFlag, ":")
+	ips := getLocalIPs()
+	if len(ips) > 0 {
+		log.Printf("Server starting on :%s (available at %s)", port, strings.Join(ips, ", "))
+	} else {
+		log.Printf("Server starting on :%s", port)
+	}
+	if verbose {
+		log.Printf("Verbose logging enabled")
+	}
 	log.Printf("Serving files from: %s", workingDir)
 	if intelligentMIME {
 		log.Printf("Intelligent MIME recognition enabled")
@@ -189,13 +253,35 @@ func main() {
 	}
 }
 
+// responseLogger wraps http.ResponseWriter to capture the status code
+type responseLogger struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rl *responseLogger) WriteHeader(code int) {
+	rl.statusCode = code
+	rl.ResponseWriter.WriteHeader(code)
+}
+
 // logRequestMiddleware wraps a handler to log HTTP requests
 func logRequestMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		log.Printf("[%s] %s %s", r.Method, r.URL.Path, r.RemoteAddr)
-		next(w, r)
-		log.Printf("[%s] %s completed in %v", r.Method, r.URL.Path, time.Since(start))
+		if verbose {
+			logVerbose("  Host: %s", r.Host)
+			logVerbose("  User-Agent: %s", r.UserAgent())
+			logVerbose("  Referer: %s", r.Referer())
+			for name, values := range r.Header {
+				for _, value := range values {
+					logVerbose("  %s: %s", name, value)
+				}
+			}
+		}
+		rl := &responseLogger{ResponseWriter: w, statusCode: http.StatusOK}
+		next(rl, r)
+		log.Printf("[%s] %s %d completed in %v", r.Method, r.URL.Path, rl.statusCode, time.Since(start))
 	}
 }
 
@@ -280,35 +366,91 @@ func globToRegex(pattern string) (*regexp.Regexp, error) {
 }
 
 // authMiddleware handles HTTP Basic Authentication
+//
+// Authentication order:
+//  1. session cookie  – set after a prior successful Basic Auth login
+//  2. Authorization header – standard HTTP Basic Auth (also sets the cookie)
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// If authentication is not enabled, proceed without checks
 		if !authEnabled {
+			logVerbose("auth: disabled, skipping")
 			next(w, r)
 			return
 		}
 
-		// Extract credentials from Basic Auth
+		logVerbose("auth: enabled, checking credentials")
+
+		// 1. Try session cookie.
+		cookieToken := ""
+		if cookie, err := r.Cookie(sessionCookieName); err == nil {
+			cookieToken = cookie.Value
+		}
+
+		// Also check ?token= query parameter (embedded in download URLs).
+		if cookieToken == "" {
+			cookieToken = r.URL.Query().Get("token")
+		}
+
+		if cookieToken != "" {
+			sessionsMu.RLock()
+			userCtx, ok := sessions[cookieToken]
+			sessionsMu.RUnlock()
+			if ok {
+				logVerbose("auth: valid session token for user '%s'", userCtx.Username)
+				ctx := setUserContext(r.Context(), userCtx)
+				r = r.WithContext(ctx)
+				next(w, r)
+				return
+			}
+			logVerbose("auth: stale session token")
+		}
+
+		// 2. Try Basic Auth.
 		username, password, ok := r.BasicAuth()
 		if !ok {
+			logVerbose("auth: no credentials, requesting auth")
 			requestAuth(w, "Authorization required")
 			return
 		}
 
-		// Authenticate and get user context
+		logVerbose("auth: basic auth for user '%s'", username)
+
 		userCtx, authenticated := authenticate(username, password)
 		if !authenticated {
+			logVerbose("auth: authentication failed for '%s'", username)
 			requestAuth(w, "Invalid credentials")
 			return
 		}
 
-		// Store user context in request context
-		ctx := r.Context()
-		ctx = setUserContext(ctx, userCtx)
+		logVerbose("auth: user '%s' authenticated, setting session cookie", username)
+
+		// Issue a session cookie so subsequent requests (including from
+		// download managers that share the cookie jar) are authenticated.
+		token := generateSessionToken()
+		sessionsMu.Lock()
+		sessions[token] = userCtx
+		sessionsMu.Unlock()
+		http.SetCookie(w, &http.Cookie{
+			Name:     sessionCookieName,
+			Value:    token,
+			Path:     "/",
+			HttpOnly: true,
+		})
+
+		ctx := setUserContext(r.Context(), userCtx)
 		r = r.WithContext(ctx)
 
 		next(w, r)
 	}
+}
+
+func generateSessionToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		log.Printf("WARNING: failed to generate session token: %v", err)
+		return ""
+	}
+	return hex.EncodeToString(b)
 }
 
 // authenticate validates credentials and returns user context
@@ -415,31 +557,39 @@ func hasWritePermission(user *UserContext, path string) bool {
 
 // browseHandler handles file browsing requests
 func browseHandler(w http.ResponseWriter, r *http.Request) {
+	logVerbose("browse: method=%s path=%s", r.Method, r.URL.Path)
+
 	if r.Method != http.MethodGet {
+		logVerbose("browse: method not allowed: %s", r.Method)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	// Get the requested path (relative to workingDir)
 	requestedPath := strings.TrimPrefix(r.URL.Path, "/")
+	logVerbose("browse: requestedPath=%s", requestedPath)
 
 	// Check read permission
 	user := getUserContext(r)
 	if !hasReadPermission(user, requestedPath) {
+		logVerbose("browse: read permission denied for path=%s", requestedPath)
 		http.Error(w, "Access denied: insufficient permissions for this path", http.StatusForbidden)
 		return
 	}
 
 	fullPath := filepath.Join(workingDir, requestedPath)
+	logVerbose("browse: fullPath=%s", fullPath)
 
 	// Security check: ensure the path is within workingDir
 	cleanPath, err := filepath.Abs(fullPath)
 	if err != nil {
+		logVerbose("browse: invalid path: %v", err)
 		http.Error(w, "Invalid path", http.StatusBadRequest)
 		return
 	}
 	cleanWorkingDir, _ := filepath.Abs(workingDir)
 	if !strings.HasPrefix(cleanPath, cleanWorkingDir) {
+		logVerbose("browse: path traversal attempt: %s not within %s", cleanPath, cleanWorkingDir)
 		http.Error(w, "Access denied", http.StatusForbidden)
 		return
 	}
@@ -448,16 +598,23 @@ func browseHandler(w http.ResponseWriter, r *http.Request) {
 	info, err := os.Stat(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			logVerbose("browse: path not found: %s", fullPath)
 			http.Error(w, "Path not found", http.StatusNotFound)
 			return
 		}
+		logVerbose("browse: error accessing path: %v", err)
 		http.Error(w, "Error accessing path", http.StatusInternalServerError)
 		return
 	}
 
 	// If it's a file, redirect to download
 	if !info.IsDir() {
-		http.Redirect(w, r, "/download/"+requestedPath, http.StatusFound)
+		target := "/download/" + requestedPath
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		logVerbose("browse: redirecting file to %s", target)
+		http.Redirect(w, r, target, http.StatusFound)
 		return
 	}
 
@@ -499,6 +656,12 @@ func browseHandler(w http.ResponseWriter, r *http.Request) {
 		Files:       files,
 	}
 
+	if authEnabled {
+		if cookie, err := r.Cookie(sessionCookieName); err == nil {
+			data.Token = cookie.Value
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := templates.ExecuteTemplate(w, "browse.html", data); err != nil {
 		log.Printf("Template error: %v", err)
@@ -508,73 +671,87 @@ func browseHandler(w http.ResponseWriter, r *http.Request) {
 
 // downloadHandler handles file downloads with resume support (Range requests)
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
+	logVerbose("download: method=%s path=%s", r.Method, r.URL.Path)
+
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		logVerbose("download: method not allowed: %s", r.Method)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	// Get the requested file path
 	requestedPath := strings.TrimPrefix(r.URL.Path, "/download/")
+	logVerbose("download: requestedPath=%s", requestedPath)
 
 	// Check read permission
 	user := getUserContext(r)
 	if !hasReadPermission(user, requestedPath) {
+		logVerbose("download: read permission denied for path=%s", requestedPath)
 		http.Error(w, "Access denied: insufficient permissions for this path", http.StatusForbidden)
 		return
 	}
+	logVerbose("download: read permission granted")
 
 	fullPath := filepath.Join(workingDir, requestedPath)
+	logVerbose("download: fullPath=%s", fullPath)
 
 	// Security check: ensure the path is within workingDir
 	cleanPath, err := filepath.Abs(fullPath)
 	if err != nil {
+		logVerbose("download: invalid path: %v", err)
 		http.Error(w, "Invalid path", http.StatusBadRequest)
 		return
 	}
 	cleanWorkingDir, _ := filepath.Abs(workingDir)
 	if !strings.HasPrefix(cleanPath, cleanWorkingDir) {
+		logVerbose("download: path traversal attempt: %s not within %s", cleanPath, cleanWorkingDir)
 		http.Error(w, "Access denied", http.StatusForbidden)
 		return
 	}
+	logVerbose("download: path security check passed")
 
 	// Open the file
 	file, err := os.Open(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			logVerbose("download: file not found: %s", fullPath)
 			http.Error(w, "File not found", http.StatusNotFound)
 			return
 		}
+		logVerbose("download: error opening file: %v", err)
 		http.Error(w, "Error opening file", http.StatusInternalServerError)
 		return
 	}
 	defer file.Close()
+	logVerbose("download: file opened successfully")
 
 	// Get file info
 	fileInfo, err := file.Stat()
 	if err != nil {
+		logVerbose("download: error statting file: %v", err)
 		http.Error(w, "Error getting file info", http.StatusInternalServerError)
 		return
 	}
 
 	// Don't allow downloading directories
 	if fileInfo.IsDir() {
+		logVerbose("download: attempt to download directory: %s", fullPath)
 		http.Error(w, "Cannot download directory", http.StatusBadRequest)
 		return
 	}
 
 	fileSize := fileInfo.Size()
 	fileName := filepath.Base(fullPath)
+	logVerbose("download: fileName=%s size=%d", fileName, fileSize)
 
 	// Determine content type and disposition
-	contentType := "application/octet-stream"
+	contentType, isViewable := getMIMEType(fullPath)
 	disposition := "attachment"
-
-	if intelligentMIME {
-		if mimeType, isViewable := getMIMEType(fullPath); isViewable {
-			contentType = mimeType
-			disposition = "inline"
-		}
+	if intelligentMIME && isViewable {
+		disposition = "inline"
 	}
+	logVerbose("download: contentType=%s disposition=%s isViewable=%v intelligentMIME=%v",
+		contentType, disposition, isViewable, intelligentMIME)
 
 	// Set headers for file download
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, disposition, fileName))
@@ -583,12 +760,19 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Handle range requests for resume support
 	rangeHeader := r.Header.Get("Range")
+	logVerbose("download: Range header: %q", rangeHeader)
+
 	if rangeHeader == "" {
 		// No range requested, send entire file
+		logVerbose("download: no range requested, serving full file (%d bytes)", fileSize)
 		w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
 		w.WriteHeader(http.StatusOK)
 		if r.Method != http.MethodHead {
-			io.Copy(w, file)
+			written, err := io.Copy(w, file)
+			if err != nil {
+				logVerbose("download: io.Copy error after %d bytes: %v", written, err)
+			}
+			logVerbose("download: sent %d bytes (200 OK)", written)
 		}
 		return
 	}
@@ -596,6 +780,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	// Parse range header
 	ranges, err := parseRange(rangeHeader, fileSize)
 	if err != nil || len(ranges) != 1 {
+		logVerbose("download: invalid range: %q (err=%v ranges=%d)", rangeHeader, err, len(ranges))
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", fileSize))
 		http.Error(w, "Invalid range", http.StatusRequestedRangeNotSatisfiable)
 		return
@@ -603,10 +788,29 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := ranges[0].start
 	end := ranges[0].end
+	logVerbose("download: parsed range: bytes=%d-%d/%d", start, end, fileSize)
+
+	// If the range covers the entire file, serve as a normal 200 response
+	if start == 0 && end == fileSize-1 {
+		logVerbose("download: range covers entire file, serving as 200 OK")
+		w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			written, err := io.Copy(w, file)
+			if err != nil {
+				logVerbose("download: io.Copy error after %d bytes: %v", written, err)
+			}
+			logVerbose("download: sent %d bytes (200 OK from full range)", written)
+		}
+		return
+	}
+
 	contentLength := end - start + 1
+	logVerbose("download: partial content: %d bytes (%d-%d)", contentLength, start, end)
 
 	// Seek to start position
 	if _, err := file.Seek(start, 0); err != nil {
+		logVerbose("download: seek error: %v", err)
 		http.Error(w, "Error seeking file", http.StatusInternalServerError)
 		return
 	}
@@ -619,13 +823,13 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	// Send the requested range
 	if r.Method != http.MethodHead {
 		io.CopyN(w, file, contentLength)
+		logVerbose("download: sent %d bytes (206 Partial Content)", contentLength)
 	}
 }
 
 // uploadHandler handles file uploads
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		// Show upload form
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := templates.ExecuteTemplate(w, "upload.html", nil); err != nil {
 			log.Printf("Template error: %v", err)
@@ -639,34 +843,22 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get user context for permission checks
 	user := getUserContext(r)
 
-	// Parse multipart form (max 100MB in memory)
 	if err := r.ParseMultipartForm(100 << 20); err != nil {
 		http.Error(w, "Error parsing form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Get the uploaded file
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, "Error retrieving file: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-
-	// Get optional subdirectory
+	// Resolve target directory (optional subdirectory)
 	subDir := r.FormValue("directory")
 	targetDir := workingDir
 	uploadPath := ""
 	if subDir != "" {
-		// Clean and validate subdirectory path
 		subDir = filepath.Clean(subDir)
 		targetDir = filepath.Join(workingDir, subDir)
 		uploadPath = subDir
 
-		// Security check
 		cleanTargetDir, err := filepath.Abs(targetDir)
 		if err != nil {
 			http.Error(w, "Invalid directory path", http.StatusBadRequest)
@@ -678,44 +870,73 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Create directory if it doesn't exist
 		if err := os.MkdirAll(targetDir, 0755); err != nil {
 			http.Error(w, "Error creating directory: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
 
-	// Create destination file path
-	fileName := filepath.Base(header.Filename)
-	dstPath := filepath.Join(targetDir, fileName)
-
-	// Build the relative path for permission checking
-	filePath := filepath.Join(uploadPath, fileName)
-
-	// Check write permission
-	if !hasWritePermission(user, filePath) {
-		http.Error(w, "Access denied: insufficient write permissions for this path", http.StatusForbidden)
-		return
+	// Collect all uploaded files (supports single "file" and batch "files")
+	var fileHeaders []*multipart.FileHeader
+	if fhs := r.MultipartForm.File["files"]; len(fhs) > 0 {
+		fileHeaders = fhs
 	}
-	dst, err := os.Create(dstPath)
-	if err != nil {
-		http.Error(w, "Error creating file: "+err.Error(), http.StatusInternalServerError)
-		return
+	if fhs := r.MultipartForm.File["file"]; len(fhs) > 0 {
+		fileHeaders = append(fileHeaders, fhs...)
 	}
-	defer dst.Close()
 
-	// Copy file content
-	if _, err := io.Copy(dst, file); err != nil {
-		http.Error(w, "Error saving file: "+err.Error(), http.StatusInternalServerError)
+	if len(fileHeaders) == 0 {
+		http.Error(w, "No files provided", http.StatusBadRequest)
 		return
 	}
 
-	// Redirect back to browse page
+	var success, failed int
+	for _, header := range fileHeaders {
+		fileName := filepath.Base(header.Filename)
+		filePath := filepath.Join(uploadPath, fileName)
+		dstPath := filepath.Join(targetDir, fileName)
+
+		logVerbose("upload: saving %s -> %s", header.Filename, dstPath)
+
+		if !hasWritePermission(user, filePath) {
+			logVerbose("upload: write permission denied for %s", filePath)
+			failed++
+			continue
+		}
+
+		file, err := header.Open()
+		if err != nil {
+			logVerbose("upload: failed to open %s: %v", header.Filename, err)
+			failed++
+			continue
+		}
+
+		dst, err := os.Create(dstPath)
+		if err != nil {
+			file.Close()
+			logVerbose("upload: failed to create %s: %v", dstPath, err)
+			failed++
+			continue
+		}
+
+		if _, err := io.Copy(dst, file); err != nil {
+			dst.Close()
+			file.Close()
+			logVerbose("upload: failed to save %s: %v", header.Filename, err)
+			failed++
+			continue
+		}
+
+		dst.Close()
+		file.Close()
+		success++
+	}
+
 	redirectPath := "/"
 	if subDir != "" {
 		redirectPath = "/" + subDir
 	}
-	http.Redirect(w, r, redirectPath+"?upload=success", http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("%s?upload=ok&success=%d&failed=%d", redirectPath, success, failed), http.StatusSeeOther)
 }
 
 // byteRange represents a byte range request
@@ -837,13 +1058,18 @@ func getMIMEType(filePath string) (string, bool) {
 		".m3u8": true,
 	}
 
-	// Text/document types that browsers can display
+	// Text/document/application types that browsers can display
 	documentTypes := map[string]bool{
 		".html": true,
 		".htm":  true,
 		".txt":  true,
 		".pdf":  true,
 		".xml":  true,
+	}
+
+	// Application types that are always downloaded
+	applicationTypes := map[string]string{
+		".apk": "application/vnd.android.package-archive",
 	}
 
 	// Check image types
@@ -920,6 +1146,11 @@ func getMIMEType(filePath string) (string, bool) {
 		case ".xml":
 			return "application/xml", true
 		}
+	}
+
+	// Check application types (always downloaded, not viewable)
+	if mime, ok := applicationTypes[ext]; ok {
+		return mime, false
 	}
 
 	return "application/octet-stream", false

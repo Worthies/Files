@@ -237,7 +237,7 @@
                                         {{ .Name }}
                                     </a>
                                 {{ else }}
-                                    <a href="/download/{{ .Path }}" class="file-name">
+                                    <a href="/download/{{ .Path }}{{ if $.Token }}?token={{ $.Token }}{{ end }}" class="file-name">
                                         <span class="file-icon">📄</span>
                                         {{ .Name }}
                                     </a>
@@ -265,16 +265,21 @@
     </div>
 
     <script>
-        // Check for success message
+        // Check for upload result
         const urlParams = new URLSearchParams(window.location.search);
-        if (urlParams.get('upload') === 'success') {
+        if (urlParams.get('upload') === 'ok') {
+            const success = parseInt(urlParams.get('success')) || 0;
+            const failed = parseInt(urlParams.get('failed')) || 0;
             const message = document.createElement('div');
             message.className = 'success-message';
-            message.textContent = '✓ File uploaded successfully!';
+            let text = '✓ ' + success + ' file(s) uploaded successfully!';
+            if (failed > 0) {
+                text += ' (' + failed + ' failed)';
+                message.style.background = '#e67e22';
+            }
+            message.textContent = text;
             document.body.insertBefore(message, document.body.firstChild);
             setTimeout(() => message.remove(), 3000);
-            
-            // Clean URL
             window.history.replaceState({}, document.title, window.location.pathname);
         }
 

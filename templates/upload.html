@@ -163,16 +163,15 @@
                 </div>
 
                 <div class="form-group">
-                    <label>Select File</label>
+                    <label>Select Files</label>
                     <div class="upload-area" id="uploadArea">
                         <div class="upload-icon">📁</div>
-                        <p>Click to select a file or drag and drop here</p>
-                        <input type="file" id="file" name="file" required style="display: none;">
+                        <p>Click to select files or drag and drop here</p>
+                        <input type="file" id="files" name="files" multiple style="display: none;">
                     </div>
                     <div class="file-info" id="fileInfo">
-                        <strong>Selected file:</strong> <span id="fileName"></span>
-                        <br>
-                        <strong>Size:</strong> <span id="fileSize"></span>
+                        <strong>Selected files:</strong>
+                        <ul id="fileList" style="margin: 8px 0 0 16px; font-size: 13px;"></ul>
                     </div>
                 </div>
 
@@ -190,28 +189,37 @@
 
     <script>
         const uploadArea = document.getElementById('uploadArea');
-        const fileInput = document.getElementById('file');
+        const fileInput = document.getElementById('files');
         const fileInfo = document.getElementById('fileInfo');
-        const fileName = document.getElementById('fileName');
-        const fileSize = document.getElementById('fileSize');
+        const fileList = document.getElementById('fileList');
         const uploadForm = document.getElementById('uploadForm');
         const progressBar = document.getElementById('progressBar');
         const progressFill = document.getElementById('progressFill');
         const uploadBtn = document.getElementById('uploadBtn');
 
-        // Click to select file
         uploadArea.addEventListener('click', () => {
             fileInput.click();
         });
 
-        // File selected
+        function displayFiles(files) {
+            fileList.innerHTML = '';
+            let totalSize = 0;
+            for (const f of files) {
+                totalSize += f.size;
+                const li = document.createElement('li');
+                li.textContent = f.name + ' (' + formatBytes(f.size) + ')';
+                fileList.appendChild(li);
+            }
+            fileInfo.classList.add('show');
+            uploadBtn.textContent = 'Upload (' + files.length + ' file' + (files.length !== 1 ? 's' : '') + ')';
+        }
+
         fileInput.addEventListener('change', (e) => {
             if (e.target.files.length > 0) {
-                displayFileInfo(e.target.files[0]);
+                displayFiles(e.target.files);
             }
         });
 
-        // Drag and drop
         uploadArea.addEventListener('dragover', (e) => {
             e.preventDefault();
             uploadArea.classList.add('dragover');
@@ -224,18 +232,11 @@
         uploadArea.addEventListener('drop', (e) => {
             e.preventDefault();
             uploadArea.classList.remove('dragover');
-            
             if (e.dataTransfer.files.length > 0) {
                 fileInput.files = e.dataTransfer.files;
-                displayFileInfo(e.dataTransfer.files[0]);
+                displayFiles(e.dataTransfer.files);
             }
         });
-
-        function displayFileInfo(file) {
-            fileName.textContent = file.name;
-            fileSize.textContent = formatBytes(file.size);
-            fileInfo.classList.add('show');
-        }
 
         function formatBytes(bytes) {
             if (bytes === 0) return '0 Bytes';
@@ -245,10 +246,8 @@
             return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
         }
 
-        // Form submission with progress
         uploadForm.addEventListener('submit', (e) => {
             e.preventDefault();
-            
             const formData = new FormData(uploadForm);
             const xhr = new XMLHttpRequest();
 
@@ -278,7 +277,6 @@
 
             xhr.open('POST', '/upload');
             xhr.send(formData);
-            
             uploadBtn.disabled = true;
         });
     </script>

@@ -11,6 +11,9 @@ func resetGlobals() {
 	authEnabled = false
 	customMIMETypes = make(map[string]string)
 	customMIMEViewable = make(map[string]bool)
+	sessionsMu.Lock()
+	sessions = make(map[string]*UserContext)
+	sessionsMu.Unlock()
 }
 
 func TestParseAuthRules_SimplePassword(t *testing.T) {
@@ -155,7 +158,6 @@ func TestParseRange(t *testing.T) {
 
 func TestAuthMiddleware(t *testing.T) {
 	resetGlobals()
-	// set auth enabled and a rule
 	authEnabled = true
 	authRules = []AuthRule{{Username: "xuser", Password: "xpass", Permission: "rw", Pattern: nil}}
 
@@ -164,26 +166,50 @@ func TestAuthMiddleware(t *testing.T) {
 		w.Write([]byte("ok"))
 	})
 
+	// No credentials → 401.
 	req := httptest.NewRequest("GET", "http://example.com/", nil)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 when no credentials provided, got %d", rr.Code)
+		t.Fatalf("expected 401 without credentials, got %d", rr.Code)
 	}
 
+	// Wrong Basic Auth → 401.
 	req = httptest.NewRequest("GET", "http://example.com/", nil)
 	req.SetBasicAuth("xuser", "wrong")
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 when wrong credentials provided, got %d", rr.Code)
+		t.Fatalf("expected 401 with wrong credentials, got %d", rr.Code)
 	}
 
+	// Correct Basic Auth → 200 + session cookie set.
 	req = httptest.NewRequest("GET", "http://example.com/", nil)
 	req.SetBasicAuth("xuser", "xpass")
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200 when correct credentials provided, got %d", rr.Code)
+		t.Fatalf("expected 200 with correct credentials, got %d", rr.Code)
+	}
+
+	// Extract the session cookie and use it for a subsequent request.
+	var sessionCookie *http.Cookie
+	for _, c := range rr.Result().Cookies() {
+		if c.Name == sessionCookieName {
+			sessionCookie = c
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatal("expected session cookie to be set after successful Basic Auth")
+	}
+
+	// Session cookie alone (no Basic Auth) → 200.
+	req = httptest.NewRequest("GET", "http://example.com/", nil)
+	req.AddCookie(sessionCookie)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 with valid session cookie, got %d", rr.Code)
 	}
 }
